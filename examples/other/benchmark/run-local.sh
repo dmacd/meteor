@@ -6,7 +6,8 @@ DURATION=120
 REPORT_INTERVAL=10
 
 set -e
-trap "echo XXX FAILED" EXIT
+PIDS=() # bash array
+trap 'echo "FAILED. Killing: ${PIDS[@]}" ; for pid in "${PIDS[@]}"; do kill $pid ; done' EXIT
 
 PROJDIR=`dirname $0`
 cd "$PROJDIR"
@@ -21,6 +22,7 @@ killall phantomjs || true
 # start the benchmark app
 ../../../meteor --production --port 9000 &
 OUTER_PID=$!
+PIDS[${#PIDS[*]}]="$OUTER_PID"
 
 
 # start a bunch of phantomjs processes
@@ -32,7 +34,8 @@ page.open(url);
 EOF
 for ((i = 0 ; i < $NUM_CLIENTS ; i++)) ; do
     sleep 2
-    phantomjs "$PHANTOMSCRIPT" &    # XXX save pid to kill later
+    phantomjs "$PHANTOMSCRIPT" &
+    PIDS[${#PIDS[*]}]="$!"
 done
 
 ps -o cputime,ppid,args | grep "$OUTER_PID" | grep main.js || true
@@ -45,11 +48,12 @@ echo
 echo TOTALS
 ps -o cputime,pid,ppid,args | grep "$OUTER_PID" | grep -v grep|| true
 
-kill -INT $OUTER_PID
-# XXX kill by pid
-killall -INT phantomjs
 
+# cleanup
+trap - EXIT
+for pid in "${PIDS[@]}"; do
+    kill -INT $pid
+done
 rm "$PHANTOMSCRIPT"
 
-trap - EXIT
 
