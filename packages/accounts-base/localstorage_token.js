@@ -40,19 +40,14 @@
 
 // Login with a Meteor access token
 //
-// XXX having errorCallback only here is weird since other login
-// methods will have different callbacks. Standardize this.
-Meteor.loginWithToken = function (token, errorCallback) {
-  Meteor.apply('login', [{resume: token}], {wait: true}, function(error, result) {
-    if (error) {
-      errorCallback();
-      throw error;
-    }
-
-    Accounts._makeClientLoggedIn(result.id, result.token);
-  });
+Meteor.loginWithToken = function (token, callback) {
+  Accounts.callLoginMethod({
+    methodArguments: [{resume: token}],
+    userCallback: callback});
 };
 
+// XXX should this be in a Meteor.startup block so that we don't have to worry
+// about load order issues?
 if (!Accounts._preventAutoLogin) {
   // Immediately try to log in via local storage, so that any DDP
   // messages are sent after we have established our user account
@@ -62,8 +57,11 @@ if (!Accounts._preventAutoLogin) {
     // request is in flight. This reduces page flicker on startup.
     var userId = Accounts._storedUserId();
     userId && Meteor.default_connection.setUserId(userId);
-    Meteor.loginWithToken(token, function () {
-      Accounts._makeClientLoggedOut();
+    Meteor.loginWithToken(token, function (err) {
+      if (err) {
+        Meteor._debug("Error logging in with token: " + err);
+        Accounts._makeClientLoggedOut();
+      }
     });
   }
 }
