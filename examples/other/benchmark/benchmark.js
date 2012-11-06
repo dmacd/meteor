@@ -107,6 +107,10 @@ if (Meteor.isClient) {
     return Meteor.status().status;
   };
 
+  Template.status.updateRate = function () {
+    return Session.get('updateRate') + ", " + Session.get('updateAvg');
+  };
+
   // do stuff periodically
 
   if (PARAMS.insertRate) {
@@ -141,9 +145,22 @@ if (Meteor.isClient) {
   }
 
 
-  // XXX Count changes per second
-  // function to update stats
-  // find({}).observe on each collection with added/removed/changed func
-  // periodic timer to update stats
+  var updateCount = 0;
+  var updateHistory = [];
+  var updateFunc = function () { updateCount += 1; };
+  _.each(Collections, function (C) {
+    C.find({}).observe({
+      added: updateFunc, changed: updateFunc, removed: updateFunc
+    });
+  });
+  Meteor.setInterval(function () {
+    updateHistory.push(updateCount);
+    if (updateHistory.length > 10)
+      updateHistory.shift();
+    Session.set('updateRate', updateCount);
+    Session.set('updateAvg', _.reduce(updateHistory, function(memo, num){
+      return memo + num; }, 0) / updateHistory.length);;
+    updateCount = 0;
+  }, 1000);
 
 }
