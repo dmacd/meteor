@@ -20,6 +20,8 @@ _Mongo = function (url) {
 
   self.collection_queue = [];
 
+  self._liveResultsSets = {};
+
   MongoDB.connect(url, function(err, db) {
     if (err)
       throw err;
@@ -258,6 +260,7 @@ _Mongo.prototype._ensureIndex = function (collectionName, index, options) {
 // It wraps a SynchronousCursor (lazily: it doesn't contact Mongo
 // until you call a method like fetch or forEach on it).
 //
+// XXX REDOC
 // _Mongo.LiveResultsSet is the "observe handle" returned from observe
 // (and _observeUnordered). It also wraps a SynchronousCursor.
 
@@ -398,6 +401,7 @@ _Mongo.SynchronousCursor.prototype.getRawObjects = function (ordered) {
   }
 };
 
+// XXX REDOC
 // options to contain:
 //  * callbacks for observe():
 //    - added (object, before_index)
@@ -412,36 +416,88 @@ _Mongo.SynchronousCursor.prototype.getRawObjects = function (ordered) {
 // attributes available on returned LiveResultsSet
 //  * stop(): end updates
 
-_Mongo.prototype._getLiveResultsSet = function (cursorDescription, ordered,
-                                                callbacks) {
+var nextObserveHandleId = 1;
+var ObserveHandle = function (liveResultsSet, callbacks) {
   var self = this;
-  return new _Mongo.LiveResultsSet(
-    cursorDescription,
-    self._createSynchronousCursor(cursorDescription),
-    ordered,
-    callbacks);
+  self._liveResultsSet = liveResultsSet;
+  self._added = callbacks.added;
+  self._changed = callbacks.changed;
+  self._removed = callbacks.removed;
+  self._moved = callbacks.moved;
+  self._observeHandleId = nextObserveHandleId++;
+};
+ObserveHandle.prototype.stop = function () {
+  var self = this;
+  self._liveResultsSet._removeObserveHandle(self);
+  self._liveResultsSet = null;
+};
+
+_Mongo.prototype._observe = function (cursorDescription, ordered, callbacks) {
+  var self = this;
+  var observeKey = JSON.stringify(
+    _.extend({ordered: ordered}, cursorDescription));
+
+  var liveResultsSet;
+  var observeHandle;
+  var newlyCreated = false;
+
+  // Find a matching LiveResultsSet, or create a new one. This next block is
+  // guaranteed to not yield (and it doesn't call anything that can observe a
+  // new query), so no other calls to this function can interleave with it.
+  Meteor._noYieldsAllowed(function () {
+    if (_.has(self._liveResultsSets, observeKey)) {
+      liveResultsSet = self._liveResultsSets[observeKey];
+    } else {
+      // Create a new LiveResultsSet. It is created "locked": no polling can
+      // take place.
+      liveResultsSet = new _Mongo.LiveResultsSet(
+        cursorDescription,
+        self._createSynchronousCursor(cursorDescription),
+        ordered,
+        function () {
+          delete self._liveResultsSets[observeKey];
+        });
+      self._liveResultsSets[observeKey] = liveResultsSet;
+      newlyCreated = true;
+    }
+    observeHandle = new ObserveHandle(liveResultsSet, callbacks);
+  });
+
+  if (newlyCreated) {
+    // This is the first ObserveHandle on this LiveResultsSet.  Add it and run
+    // the initial synchronous poll (which may yield).
+    liveResultsSet._addFirstObserveHandle(observeHandle);
+  } else {
+    // Not the first ObserveHandle. Add it to the LiveResultsSet. This call
+    // yields until we're not in the middle of a poll, and its invocation of the
+    // initial 'added' callbacks may yield as well. It blocks until the 'added'
+    // callbacks have fired.
+    liveResultsSet._addObserveHandleAndSendInitialAdds(observeHandle);
+  }
+
+  return observeHandle;
 };
 
 _Mongo.Cursor.prototype.observe = function (callbacks) {
   var self = this;
-  return self._mongo._getLiveResultsSet(
+  return self._mongo._observe(
     self._cursorDescription, true, callbacks);
 };
 
 _Mongo.Cursor.prototype._observeUnordered = function (callbacks) {
   var self = this;
-  return self._mongo._getLiveResultsSet(
+  return self._mongo._observe(
     self._cursorDescription, false, callbacks);
 };
 
 _Mongo.LiveResultsSet = function (cursorDescription, synchronousCursor, ordered,
-                                  callbacks) {
+                                  stopCallback) {
   var self = this;
 
   self._cursorDescription = cursorDescription;
   self._synchronousCursor = synchronousCursor;
-
   self._ordered = ordered;
+  self._stopCallbacks = [stopCallback];
 
   // previous results snapshot.  on each poll cycle, diffs against
   // results drives the callbacks.
@@ -450,102 +506,211 @@ _Mongo.LiveResultsSet = function (cursorDescription, synchronousCursor, ordered,
   // state for polling
   self._dirty = false; // do we need polling?
   self._pendingWrites = []; // people to notify when polling completes
-  self._pollRunning = false; // is polling in progress now?
+  // XXX explain lock
   self._pollingSuspended = false; // is polling temporarily suspended?
 
-  // (each instance of the class needs to get a separate throttling
-  // context -- we don't want to coalesce invocations of markDirty on
-  // different instances!)
+  // (each instance of the class needs to get a separate throttling context --
+  // we don't want to coalesce invocations of markDirty on different
+  // instances!)
   self._markDirty = _.throttle(self._unthrottledMarkDirty, 50 /* ms */);
 
-  // listen for the invalidation messages that will trigger us to poll
-  // the database for changes
+  // listen for the invalidation messages that will trigger us to poll the
+  // database for changes
   var keys = (cursorDescription.options.key ||
               {collection: cursorDescription.collectionName});
   if (!(keys instanceof Array))
     keys = [keys];
-  self._crossbarListeners = _.map(keys, function (key) {
-    return Meteor._InvalidationCrossbar.listen(key, function (notification,
-                                                              complete) {
-      // When someone does a transaction that might affect us,
-      // schedule a poll of the database. If that transaction happens
-      // inside of a write fence, block the fence until we've polled
-      // and notified observers.
-      var fence = Meteor._CurrentWriteFence.get();
-      if (fence)
-        self._pendingWrites.push(fence.beginWrite());
-      self._markDirty();
-      complete();
-    });
+  _.each(keys, function (key) {
+    // XXX document assumption that listen doesn't yield
+    var listener = Meteor._InvalidationCrossbar.listen(
+      key, function (notification, complete) {
+        // When someone does a transaction that might affect us, schedule a poll
+        // of the database. If that transaction happens inside of a write fence,
+        // block the fence until we've polled and notified observers.
+        var fence = Meteor._CurrentWriteFence.get();
+        if (fence)
+          self._pendingWrites.push(fence.beginWrite());
+        self._markDirty();
+        complete();
+      });
+    self._stopCallbacks.push(function () { listener.stop(); });
   });
 
-  // user callbacks
-  self._callbacks = callbacks;
+  // XXX doc
+  self._observeHandles = {};
+  self._observeHandleAddQueue = [];
 
-  // run the first _poll() cycle synchronously.
-  self._pollRunning = true;
-  self._doPoll();
-  self._pollRunning = false;
+  self._callbackMultiplexer = {};
+  var callbackNames = ['added', 'changed', 'removed'];
+  if (self._ordered)
+    callbackNames.push('moved');
+  _.each(callbackNames, function (callback) {
+    var handleCallback = '_' + callback;
+    self._callbackMultiplexer[callback] = function () {
+      var args = _.toArray(arguments);
+      // Calls to _removeObserveHandle are NOT SYNCHRONIZED with the polling
+      // process in the same way that calls to
+      // _addObserveHandleAndSendInitialAdds are, so it's possible that handles
+      // are removed from the set whille we're in the middle of multiplexing a
+      // callback. So we save a copy of the list of handle ids first rather than
+      // directly iterating over _observeHandles.
+      var handleIds = _.keys(self._observeHandles);
+      _.each(handleIds, function (handleId) {
+        var handle = self._observeHandles[handleId];
+        if (handle && handle[handleCallback])
+          handle[handleCallback].apply(null, args);
+      });
+    };
+  });
 
   // every once and a while, poll even if we don't think we're dirty,
   // for eventual consistency with database writes from outside the
   // Meteor universe
-  self._refreshTimer = Meteor.setInterval(_.bind(self._markDirty, this),
-                                          10 * 1000 /* 10 seconds */);
+  var intervalHandle = Meteor.setInterval(
+    _.bind(self._markDirty, self), 10 * 1000 /* 10 seconds */);
+  self._stopCallbacks.push(function () {
+    Meteor.clearInterval(intervalHandle);
+  });
+
+  self._pollLock = true;
 };
 
-_Mongo.LiveResultsSet.prototype._unthrottledMarkDirty = function () {
-  var self = this;
+_.extend(_Mongo.LiveResultsSet.prototype, {
+  _addFirstObserveHandle: function (handle) {
+    var self = this;
+    if (!self._pollLock)
+      throw new Error("not locked (_addFirstObserveHandle)");
 
-  self._dirty = true;
-  if (self._pollingSuspended)
-    return; // don't poll when told not to
-  if (self._pollRunning)
-    return; // only one instance can run at once. just tell it to re-cycle.
-  self._pollRunning = true;
+    if (! _.isEmpty(self._observeHandles))
+      throw new Error("Not the first observe handle!");
+    self._observeHandles[handle._observeHandleId] = handle;
 
-  Fiber(function () {
-    self._dirty = false;
-    var writesForCycle = self._pendingWrites;
-    self._pendingWrites = [];
-    self._doPoll(); // could yield, and set self._dirty
-    _.each(writesForCycle, function (w) {w.committed();});
+    // Run the first _poll() cycle synchronously (delivering results to the
+    // first ObserveHandle).
+    self._doPoll();
+    Meteor.defer(function () {
+      self._maybeUnlock();
+    });
+  },
 
-    self._pollRunning = false;
-    if (self._dirty || self._pendingWrites.length)
-      // rerun ourselves, but through _.throttle
-      self._markDirty();
-  }).run();
-};
+  _unthrottledMarkDirty: function () {
+    var self = this;
 
-// interface for tests to control when polling happens
-_Mongo.LiveResultsSet.prototype._suspendPolling = function() {
-  this._pollingSuspended = true;
-};
-_Mongo.LiveResultsSet.prototype._resumePolling = function() {
-  this._pollingSuspended = false;
-  this._unthrottledMarkDirty(); // poll NOW, don't wait
-};
+    self._dirty = true;
+    if (self._pollingSuspended)
+      return; // don't poll when told not to
+    if (self._pollLock)
+      return; // only one instance can run at once. just tell it to re-cycle.
+    self._pollLock = true;
 
+    Fiber(function () {
+      self._dirty = false;
+      var writesForCycle = self._pendingWrites;
+      self._pendingWrites = [];
+      self._doPoll(); // could yield, and set self._dirty
+      _.each(writesForCycle, function (w) {w.committed();});
 
-_Mongo.LiveResultsSet.prototype._doPoll = function () {
-  var self = this;
+      // If we we became invalid during the poll, run again soon (but throttled)
+      if (self._dirty || self._pendingWrites.length) {
+        Meteor.defer(function () {
+          self._markDirty();
+        });
+      }
 
-  // Get the new query results
-  self._synchronousCursor.rewind();
-  var new_results = self._synchronousCursor.getRawObjects(self._ordered);
-  var old_results = self._results;
+      self._maybeUnlock();
+    }).run();
+  },
 
-  LocalCollection._diffQuery(
-    self._ordered, old_results, new_results, self._callbacks, true);
-  self._results = new_results;
-};
+  // interface for tests to control when polling happens.
+  _suspendPolling: function() {
+    this._pollingSuspended = true;
+  },
+  _resumePolling: function() {
+    this._pollingSuspended = false;
+    this._unthrottledMarkDirty(); // poll NOW, don't wait
+  },
 
-_Mongo.LiveResultsSet.prototype.stop = function () {
-  var self = this;
-  _.each(self._crossbarListeners, function (l) { l.stop(); });
-  Meteor.clearInterval(self._refreshTimer);
-};
+  _doPoll: function () {
+    var self = this;
+
+    // Get the new query results
+    self._synchronousCursor.rewind();
+    var newResults = self._synchronousCursor.getRawObjects(self._ordered);
+    var oldResults = self._results;
+
+    if (!_.isEmpty(self._observeHandles))
+      LocalCollection._diffQuery(
+        self._ordered, oldResults, newResults, self._callbackMultiplexer, true);
+    // Replace self._results atomically.
+    self._results = newResults;
+  },
+
+  _addObserveHandleAndSendInitialAdds: function (handle) {
+    var self = this;
+
+    if (self._pollLock) {
+      // XXX explain this.
+      var future = new Future;
+      self._observeHandleAddQueue.push({handle: handle, future: future});
+      future.wait();
+    } else {
+      self._pollLock = true;
+      self._addObserveHandleAndSendInitialAddsLocked(handle);
+    }
+  },
+
+  // Adds the observe handle to this set and sends its initial added
+  // callbacks. While the added callbacks may yield, they won't cause a new poll
+  // to run because we're locked. Defers a request to unlock.
+  _addObserveHandleAndSendInitialAddsLocked: function (handle) {
+    var self = this;
+    if (!self._pollLock)
+      throw new Error("not locked (_addObserveHandleAndSendInitialAddsLocked)");
+
+    if (_.has(self._observeHandles, handle._observeHandleId))
+      throw new Error("Duplicate observe handle ID");
+    self._observeHandles[handle._observeHandleId] = handle;
+
+    // Send initial adds.
+    _.each(self._results, function (doc, i) {
+      handle._added(LocalCollection._deepcopy(doc),
+                    self._ordered ? i : undefined);
+    });
+
+    Meteor.defer(function () {
+      self._maybeUnlock();
+    });
+  },
+
+  // Note: this function does not return.
+  _maybeUnlock: function (handle) {
+    var self = this;
+    if (!self._pollLock)
+      throw new Error("not locked (_maybeUnlock)");
+    if (_.isEmpty(self._observeHandleAddQueue)) {
+      self._pollLock = false;
+      return;
+    }
+    var nextHandle = self._observeHandleAddQueue.shift();
+    // Add the next handle, deliver its added calls, and defer another call to
+    // this function.
+    self._addObserveHandleAndSendInitialAddsLocked(nextHandle.handle);
+    // Let the _addObserveHandleAndSendInitialAdds call return.
+    nextHandle.future.ret();
+  },
+
+  // Note: this might be called in the middle of _doPoll!
+  _removeObserveHandle: function (handle) {
+    var self = this;
+    if (!_.has(self._observeHandles, handle._observeHandleId))
+      throw new Error("Unknown observe handle ID " + handle._observeHandleId);
+    delete self._observeHandles[handle._observeHandleId];
+
+    if (_.isEmpty(self._observeHandles)) {
+      _.each(self._stopCallbacks, function (c) { c(); });
+    }
+  }
+});
 
 _.extend(Meteor, {
   _Mongo: _Mongo
